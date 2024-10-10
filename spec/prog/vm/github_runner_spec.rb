@@ -419,6 +419,7 @@ RSpec.describe Prog::Vm::GithubRunner do
     it "hops to register_runner" do
       expect(Config).to receive_messages(github_cache_forked_runner_tarball_uri: "https://github.com/foo/tarball")
       expect(vm).to receive(:vm_host).and_return(instance_double(VmHost, ubid: "vhfdmbbtdz3j3h8hccf8s9wz94", location: "hetzner-hel1", data_center: "FSN1-DC8")).at_least(:once)
+      expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"))])
       expect(github_runner.installation).to receive(:project).and_return(instance_double(Project, ubid: "pjwnadpt27b21p81d7334f11rx", path: "/project/pjwnadpt27b21p81d7334f11rx")).at_least(:once)
       expect(sshable).to receive(:cmd).with(<<~COMMAND)
         curl --output actions-runner.tar.gz -L https://github.com/foo/tarball
@@ -438,17 +439,18 @@ RSpec.describe Prog::Vm::GithubRunner do
         sudo rm -rf /home/runner/actions-runner
         sudo mv ./actions-runner /home/runner/
         sudo chown -R runner:runner /home/runner/actions-runner
-        echo "CUSTOM_ACTIONS_CACHE_URL=http://localhost:51123/random_token/" | sudo tee -a /etc/environment
+        echo "CUSTOM_ACTIONS_CACHE_URL=http://10.0.0.1:51123/random_token/" | sudo tee -a /etc/environment
         echo "127.0.0.1 localhost.blob.core.windows.net" | sudo tee -a /etc/hosts
       COMMAND
 
-      expect { nx.setup_forked_runner }.to hop("download_proxy")
+      expect { nx.setup_forked_runner }.to hop("clear_ubicloud_resolve_conf")
     end
 
     it "hops to register_runner arm" do
       expect(Config).to receive_messages(github_cache_forked_runner_tarball_uri_arm64: "https://github.com/foo/tarball")
       expect(github_runner).to receive(:label).and_return("ubicloud-arm").at_least(:once)
       expect(vm).to receive(:vm_host).and_return(instance_double(VmHost, ubid: "vhfdmbbtdz3j3h8hccf8s9wz94", location: "hetzner-hel1", data_center: "FSN1-DC8")).at_least(:once)
+      expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"))])
       expect(github_runner.installation).to receive(:project).and_return(instance_double(Project, ubid: "pjwnadpt27b21p81d7334f11rx", path: "/project/pjwnadpt27b21p81d7334f11rx")).at_least(:once)
       expect(sshable).to receive(:cmd).with(<<~COMMAND)
         curl --output actions-runner.tar.gz -L https://github.com/foo/tarball
@@ -468,11 +470,23 @@ RSpec.describe Prog::Vm::GithubRunner do
         sudo rm -rf /home/runner/actions-runner
         sudo mv ./actions-runner /home/runner/
         sudo chown -R runner:runner /home/runner/actions-runner
-        echo "CUSTOM_ACTIONS_CACHE_URL=http://localhost:51123/random_token/" | sudo tee -a /etc/environment
+        echo "CUSTOM_ACTIONS_CACHE_URL=http://10.0.0.1:51123/random_token/" | sudo tee -a /etc/environment
         echo "127.0.0.1 localhost.blob.core.windows.net" | sudo tee -a /etc/hosts
       COMMAND
 
-      expect { nx.setup_forked_runner }.to hop("download_proxy")
+      expect { nx.setup_forked_runner }.to hop("clear_ubicloud_resolve_conf")
+    end
+  end
+
+  describe "#clear_ubicloud_resolve_conf" do
+    it "hops to download_proxy" do
+      expect(sshable).to receive(:cmd).with(<<~COMMAND)
+        sudo rm -f /etc/systemd/resolved.conf.d/Ubicloud.conf
+        sudo systemctl restart systemd-resolved
+        sudo systemctl restart docker
+      COMMAND
+
+      expect { nx.clear_ubicloud_resolve_conf }.to hop("download_proxy")
     end
   end
 

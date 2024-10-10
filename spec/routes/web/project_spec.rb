@@ -8,7 +8,7 @@ RSpec.describe Clover, "project" do
 
   let(:project) { user.create_project_with_default_policy("project-1") }
 
-  let(:project_wo_permissions) { user.create_project_with_default_policy("project-2", policy_body: []) }
+  let(:project_wo_permissions) { user.create_project_with_default_policy("project-2", default_policy: nil) }
 
   describe "unauthenticated" do
     it "can not list without login" do
@@ -181,17 +181,31 @@ RSpec.describe Clover, "project" do
         expect(page).to have_content "Forbidden"
       end
 
-      it "can invite existing user to project" do
+      it "can invite existing user to project with a default policy" do
         visit "#{project.path}/user"
 
         expect(page).to have_content user.email
         expect(page).to have_no_content user2.email
 
         fill_in "Email", with: user2.email
+        select "Admin", from: "policy"
         click_button "Invite"
 
         expect(page).to have_content user.email
         expect(page).to have_content user2.email
+        expect(page).to have_select("user_policies[#{user2.ubid}]", selected: "Admin")
+        expect(Mail::TestMailer.deliveries.length).to eq 1
+      end
+
+      it "can invite existing user to project without a default policy" do
+        visit "#{project.path}/user"
+
+        fill_in "Email", with: user2.email
+        select "No policy", from: "policy"
+        click_button "Invite"
+
+        expect(page).to have_content user2.email
+        expect(page).to have_select("user_policies[#{user2.ubid}]", selected: nil)
         expect(Mail::TestMailer.deliveries.length).to eq 1
       end
 
@@ -201,11 +215,13 @@ RSpec.describe Clover, "project" do
         expect(page).to have_content user.email
 
         fill_in "Email", with: new_email
+        select "Admin", from: "policy"
         click_button "Invite"
 
         expect(page).to have_content user.email
         expect(page).to have_content new_email
         expect(page).to have_content "Invitation sent successfully to '#{new_email}'."
+        expect(page).to have_select("invitation_policies[#{new_email}]", selected: "Admin")
         expect(Mail::TestMailer.deliveries.length).to eq 1
         expect(ProjectInvitation.where(email: new_email).count).to eq 1
 
@@ -217,6 +233,7 @@ RSpec.describe Clover, "project" do
 
       it "can remove user from project" do
         user2.associate_with_project(project)
+        Authorization::ManagedPolicy::Member.apply(project, [user2])
 
         visit "#{project.path}/user"
 
@@ -235,6 +252,25 @@ RSpec.describe Clover, "project" do
         expect(page).to have_no_content user2.email
       end
 
+      it "can update default policy of an user" do
+        user2.associate_with_project(project)
+        Authorization::ManagedPolicy::Member.apply(project, [user2])
+        # Just add a nonexistent subject to it to test edge case
+        policy = project.access_policies_dataset.where(name: "member").first
+        policy.body["acls"].first["subjects"] << "user/new@test.com"
+        policy.modified!(:body)
+        policy.save_changes
+
+        visit "#{project.path}/user"
+
+        expect(page).to have_select("user_policies[#{user2.ubid}]", selected: "Member")
+        within "form#managed-policy" do
+          select "Admin", from: "user_policies[#{user2.ubid}]"
+          click_button "Update"
+        end
+        expect(page).to have_select("user_policies[#{user2.ubid}]", selected: "Admin")
+      end
+
       it "can remove invited user from project" do
         invited_email = "invited@example.com"
         project.add_invitation(email: invited_email, inviter_id: "bd3479c6-5ee3-894c-8694-5190b76f84cf", expires_at: Time.now + 7 * 24 * 60 * 60)
@@ -249,6 +285,22 @@ RSpec.describe Clover, "project" do
 
         visit "#{project.path}/user"
         expect { find "#invitation-#{invited_email.gsub(/\W+/, "")} .delete-btn" }.to raise_error Capybara::ElementNotFound
+      end
+
+      it "can update default policy of invited user" do
+        invited_email = "invited@example.com"
+        project.add_invitation(email: invited_email, policy: "member", inviter_id: "bd3479c6-5ee3-894c-8694-5190b76f84cf", expires_at: Time.now + 7 * 24 * 60 * 60)
+        inv2 = project.add_invitation(email: "invited2@example.com", policy: "member", inviter_id: "bd3479c6-5ee3-894c-8694-5190b76f84cf", expires_at: Time.now + 7 * 24 * 60 * 60)
+
+        visit "#{project.path}/user"
+
+        inv2.destroy
+        expect(page).to have_select("invitation_policies[#{invited_email}]", selected: "Member")
+        within "form#managed-policy" do
+          select "Admin", from: "invitation_policies[#{invited_email}]"
+          click_button "Update"
+        end
+        expect(page).to have_select("invitation_policies[#{invited_email}]", selected: "Admin")
       end
 
       it "can not have more than 50 pending invitations" do
@@ -288,51 +340,48 @@ RSpec.describe Clover, "project" do
       end
     end
 
-    describe "access policies" do
-      it "can show project policy" do
-        visit project.path
-
-        within "#desktop-menu" do
-          click_link "Access Policy"
-        end
-
-        expect(page.title).to eq("Ubicloud - #{project.name} - Policy")
-        expect(page).to have_content project.access_policies.first.body.to_json
-      end
-
-      it "raises forbidden when does not have permissions" do
-        visit "#{project_wo_permissions.path}/policy"
-
-        expect(page.title).to eq("Ubicloud - Forbidden")
-        expect(page.status_code).to eq(403)
-        expect(page).to have_content "Forbidden"
-      end
-
-      it "can update policy" do
-        current_policy = project.access_policies.first.body
+    describe "advanced policy" do
+      it "can update policy if doesn't have already" do
         new_policy = {
           acls: [
-            {actions: ["Project:policy"], objects: project.hyper_tag_name, subjects: user.hyper_tag_name}
+            {actions: ["Project:user"], objects: project.hyper_tag_name, subjects: user.hyper_tag_name}
           ]
         }
 
-        visit "#{project.path}/policy"
+        visit "#{project.path}/user"
+        within "form#advanced-policy" do
+          fill_in "body", with: new_policy.to_json
+          click_button "Update"
+        end
+        expect(page).to have_content new_policy.to_json
+        expect(project.access_policies_dataset.where(managed: false).first.body.to_json).to eq(new_policy.to_json)
+      end
 
+      it "can update policy existing advanced policy" do
+        current_policy = AccessPolicy.create_with_id(project_id: project.id, name: "advanced", body: {acls: [{subjects: user.hyper_tag_name, actions: ["*"], objects: project.hyper_tag_name}]}).body
+        new_policy = {
+          acls: [
+            {actions: ["Project:user"], objects: project.hyper_tag_name, subjects: user.hyper_tag_name}
+          ]
+        }
+
+        visit "#{project.path}/user"
         expect(page).to have_content current_policy.to_json
-
-        fill_in "body", with: new_policy.to_json
-        click_button "Update"
-
+        within "form#advanced-policy" do
+          fill_in "body", with: new_policy.to_json
+          click_button "Update"
+        end
         expect(page).to have_content new_policy.to_json
       end
 
       it "can not update policy when it is not valid JSON" do
         current_policy = project.access_policies.first.body
 
-        visit "#{project.path}/policy"
-
-        fill_in "body", with: "{'invalid': 'json',}"
-        click_button "Update"
+        visit "#{project.path}/user"
+        within "form#advanced-policy" do
+          fill_in "body", with: "{'invalid': 'json',}"
+          click_button "Update"
+        end
 
         expect(page).to have_content "The policy isn't a valid JSON object."
         expect(page).to have_content "{'invalid': 'json',}"
@@ -342,24 +391,15 @@ RSpec.describe Clover, "project" do
       it "can not update policy when its root is not JSON object" do
         current_policy = project.access_policies.first.body
 
-        visit "#{project.path}/policy"
-
-        fill_in "body", with: "[{}, {}]"
-        click_button "Update"
+        visit "#{project.path}/user"
+        within "form#advanced-policy" do
+          fill_in "body", with: "[{}, {}]"
+          click_button "Update"
+        end
 
         expect(page).to have_content "The policy isn't a valid JSON object."
         expect(page).to have_content "[{}, {}]"
         expect(current_policy).to eq(project.access_policies.first.body)
-      end
-
-      it "raises not found when access policy not exists" do
-        expect(AccessPolicy).to receive(:[]).and_return(nil)
-
-        visit "#{project.path}/policy/pcqv67qwh9t23k4g88xrjya7eb"
-
-        expect(page.title).to eq("Ubicloud - ResourceNotFound")
-        expect(page.status_code).to eq(404)
-        expect(page).to have_content "ResourceNotFound"
       end
     end
 
@@ -398,9 +438,11 @@ RSpec.describe Clover, "project" do
 
       it "can not delete project when does not have permissions" do
         # Give permission to view, so we can see the detail page
-        project_wo_permissions.access_policies.first.update(body: {acls: [
-          {subjects: user.hyper_tag_name, actions: ["Project:view"], objects: project_wo_permissions.hyper_tag_name}
-        ]})
+        AccessPolicy.create_with_id(
+          project_id: project_wo_permissions.id,
+          name: "only-view",
+          body: {acls: [{subjects: user.hyper_tag_name, actions: ["Project:view"], objects: project_wo_permissions.hyper_tag_name}]}
+        )
 
         visit project_wo_permissions.path
 
