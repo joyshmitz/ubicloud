@@ -9,7 +9,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
   subject_is :inference_endpoint_replica
 
   extend Forwardable
-  def_delegators :inference_endpoint_replica, :vm, :inference_endpoint, :load_balancers_vm
+  def_delegators :inference_endpoint_replica, :vm, :inference_endpoint, :load_balancer_vm_port
 
   def self.assemble(inference_endpoint_id)
     DB.transaction do
@@ -102,7 +102,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
         replica_ubid: inference_endpoint_replica.ubid,
         ssl_crt_path: "/ie/workdir/ssl/ubi_cert.pem",
         ssl_key_path: "/ie/workdir/ssl/ubi_key.pem",
-        gateway_port: inference_endpoint.load_balancer.dst_port,
+        gateway_port: inference_endpoint.load_balancer.ports.first.dst_port,
         max_requests: inference_endpoint.max_requests
       }
       params_json = JSON.generate(params)
@@ -150,7 +150,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
   end
 
   def available?
-    load_balancers_vm.reload.state == "up"
+    load_balancer_vm_port.reload.state == "up"
   end
 
   def create_page
@@ -213,18 +213,20 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
     resp = vm.sshable.cmd("sudo curl -m 5 -s -H \"Content-Type: application/json\" -X POST --data-binary @- --unix-socket /ie/workdir/inference-gateway.clover.sock http://localhost/control", stdin: body.to_json)
     project_usage = JSON.parse(resp)["projects"]
     Clog.emit("Successfully pinged inference gateway.") { {inference_endpoint: inference_endpoint.ubid, replica: inference_endpoint_replica.ubid, project_usage: project_usage} }
-    update_billing_records(project_usage)
+    update_billing_records(project_usage, "input", "prompt_token_count")
+    update_billing_records(project_usage, "output", "completion_token_count")
   end
 
-  def update_billing_records(project_usage)
-    rate = BillingRate.from_resource_properties("InferenceTokens", inference_endpoint.model_name, "global")
+  def update_billing_records(project_usage, token_type, usage_key)
+    resource_family = "#{inference_endpoint.model_name}-#{token_type}"
+    rate = BillingRate.from_resource_properties("InferenceTokens", resource_family, "global")
     return if rate["unit_price"].zero?
     rate_id = rate["id"]
     begin_time = Time.now.to_date.to_time
     end_time = begin_time + 24 * 60 * 60
 
     project_usage.each do |usage|
-      tokens = usage["prompt_token_count"] + usage["completion_token_count"]
+      tokens = usage[usage_key]
       next if tokens.zero?
       project = Project.from_ubid(usage["ubid"])
 
@@ -241,7 +243,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
           BillingRecord.create_with_id(
             project_id: project.id,
             resource_id: inference_endpoint.id,
-            resource_name: "Inference tokens #{inference_endpoint.model_name} #{begin_time.strftime("%Y-%m-%d")}",
+            resource_name: "#{resource_family} #{begin_time.strftime("%Y-%m-%d")}",
             billing_rate_id: rate_id,
             span: Sequel.pg_range(begin_time...end_time),
             amount: tokens

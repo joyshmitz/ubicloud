@@ -82,12 +82,12 @@ class Clover
     runner = GithubRunner.first(
       installation_id: installation.id,
       repository_name: data["repository"]["full_name"],
-      runner_id: runner_id
+      runner_id:
     )
 
     return error("Unregistered runner") unless runner
 
-    runner.update(workflow_job: job.except("steps"))
+    runner.this.update(workflow_job: Sequel.pg_jsonb(job.except("steps")))
 
     case data["action"]
     when "in_progress"

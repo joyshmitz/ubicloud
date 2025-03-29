@@ -377,12 +377,10 @@ RSpec.describe Prog::Vm::GithubRunner do
 
   describe "#setup_environment" do
     it "hops to register_runner" do
-      expect(Config).to receive(:docker_mirror_server_vm_id).and_return(vm.id).at_least(:once)
-      expect(Vm).to receive(:[]).with(vm.id).and_return(vm).at_least(:once)
       expect(vm).to receive(:vm_host).and_return(instance_double(VmHost, ubid: "vhfdmbbtdz3j3h8hccf8s9wz94", location_id: Location::HETZNER_FSN1_ID, data_center: "FSN1-DC8", id: "788525ed-d6f0-4937-a844-323d4fd91946")).at_least(:once)
       expect(vm).to receive(:runtime_token).and_return("my_token")
-      expect(vm).to receive(:load_balancer).and_return(instance_double(LoadBalancer, hostname: "test.lb.ubicloud.com"))
       expect(github_runner.installation).to receive(:project).and_return(instance_double(Project, ubid: "pjwnadpt27b21p81d7334f11rx", path: "/project/pjwnadpt27b21p81d7334f11rx")).at_least(:once)
+      expect(github_runner.installation).to receive(:use_docker_mirror).and_return(true)
       expect(github_runner.installation).to receive(:cache_enabled).and_return(false)
       expect(sshable).to receive(:cmd).with(<<~COMMAND)
         set -ueo pipefail
@@ -392,16 +390,16 @@ RSpec.describe Prog::Vm::GithubRunner do
         echo "UBICLOUD_RUNTIME_TOKEN=my_token
         UBICLOUD_CACHE_URL=http://localhost:9292/runtime/github/" | sudo tee -a /etc/environment
         if [ -f /etc/docker/daemon.json ] && [ -s /etc/docker/daemon.json ]; then
-          sudo jq '. + {"registry-mirrors": ["https://test.lb.ubicloud.com:5000"]}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.tmp
+          sudo jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.tmp
           sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
         else
-          echo '{"registry-mirrors": ["https://test.lb.ubicloud.com:5000"]}' | sudo tee /etc/docker/daemon.json
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
         fi
         sudo mkdir -p /etc/buildkit
         echo '
           [registry."docker.io"]
-            mirrors = ["test.lb.ubicloud.com:5000"]
-          [registry."test.lb.ubicloud.com:5000"]
+            mirrors = ["mirror.gcr.io"]
+          [registry."mirror.gcr.io"]
             http = false
             insecure = false' | sudo tee -a /etc/buildkit/buildkitd.toml
         sudo systemctl daemon-reload
@@ -412,10 +410,10 @@ RSpec.describe Prog::Vm::GithubRunner do
     end
 
     it "hops to register_runner without setting up registry mirror" do
-      expect(Config).to receive(:docker_mirror_server_vm_id).and_return(nil)
       expect(vm).to receive(:vm_host).and_return(instance_double(VmHost, ubid: "vhfdmbbtdz3j3h8hccf8s9wz94", location_id: Location::HETZNER_FSN1_ID, data_center: "FSN1-DC8", id: "788525ed-d6f0-4937-a844-323d4fd91946")).at_least(:once)
       expect(vm).to receive(:runtime_token).and_return("my_token")
       expect(github_runner.installation).to receive(:project).and_return(instance_double(Project, ubid: "pjwnadpt27b21p81d7334f11rx", path: "/project/pjwnadpt27b21p81d7334f11rx")).at_least(:once)
+      expect(github_runner.installation).to receive(:use_docker_mirror).and_return(false)
       expect(github_runner.installation).to receive(:cache_enabled).and_return(false)
       expect(sshable).to receive(:cmd).with(<<~COMMAND)
         set -ueo pipefail
@@ -433,6 +431,7 @@ RSpec.describe Prog::Vm::GithubRunner do
       expect(vm).to receive(:vm_host).and_return(instance_double(VmHost, ubid: "vhfdmbbtdz3j3h8hccf8s9wz94", location_id: Location::HETZNER_FSN1_ID, data_center: "FSN1-DC8", id: "788525ed-d6f0-4937-a844-323d4fd91946")).at_least(:once)
       expect(vm).to receive(:runtime_token).and_return("my_token")
       expect(github_runner.installation).to receive(:project).and_return(instance_double(Project, ubid: "pjwnadpt27b21p81d7334f11rx", path: "/project/pjwnadpt27b21p81d7334f11rx")).at_least(:once)
+      expect(github_runner.installation).to receive(:use_docker_mirror).and_return(false)
       expect(github_runner.installation).to receive(:cache_enabled).and_return(true)
       expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"))]).at_least(:once)
       expect(sshable).to receive(:cmd).with(<<~COMMAND)
@@ -553,6 +552,62 @@ RSpec.describe Prog::Vm::GithubRunner do
     end
   end
 
+  describe ".collect_final_telemetry" do
+    it "Logs journalctl and docker limits if workflow_job is not successful" do
+      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "failure"})
+      vmh_sshable = instance_double(Sshable)
+      expect(vm.vm_host).to receive(:sshable).and_return(vmh_sshable)
+      expect(vmh_sshable).to receive(:cmd).with("sudo ln /vm/9qf22jbv/serial.log /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
+      expect(sshable).to receive(:cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
+      expect(sshable).to receive(:cmd).with(<<~COMMAND)
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+        curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
+      COMMAND
+
+      nx.collect_final_telemetry
+    end
+
+    it "Logs journalctl and docker limits if workflow_job is nil" do
+      expect(github_runner).to receive(:workflow_job).and_return(nil)
+      vmh_sshable = instance_double(Sshable)
+      expect(vm.vm_host).to receive(:sshable).and_return(vmh_sshable)
+      expect(vmh_sshable).to receive(:cmd).with("sudo ln /vm/9qf22jbv/serial.log /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
+      expect(sshable).to receive(:cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
+      expect(sshable).to receive(:cmd).with(<<~COMMAND)
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+        curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
+      COMMAND
+
+      nx.collect_final_telemetry
+    end
+
+    it "Logs only docker limits if workflow_job is successful" do
+      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "success"})
+      expect(sshable).to receive(:cmd).with(<<~COMMAND)
+        TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+        curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
+      COMMAND
+
+      nx.collect_final_telemetry
+    end
+
+    it "doesn't fail if it failed due to Sshable::SshError" do
+      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "success"})
+      expect(sshable).to receive(:cmd).and_raise Sshable::SshError.new("bogus", "", "", nil, nil)
+      expect(Clog).to receive(:emit).with("Failed to collect final telemetry").and_call_original
+
+      nx.collect_final_telemetry
+    end
+
+    it "doesn't fail if it failed due to Net::SSH::ConnectionTimeout" do
+      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "success"})
+      expect(sshable).to receive(:cmd).and_raise Net::SSH::ConnectionTimeout
+      expect(Clog).to receive(:emit).with("Failed to collect final telemetry").and_call_original
+
+      nx.collect_final_telemetry
+    end
+  end
+
   describe "#destroy" do
     it "naps if runner not deregistered yet" do
       expect(client).to receive(:get).and_return(busy: false)
@@ -571,17 +626,12 @@ RSpec.describe Prog::Vm::GithubRunner do
       expect(nx).to receive(:decr_destroy)
       expect(client).to receive(:get).and_raise(Octokit::NotFound)
       expect(client).not_to receive(:delete)
-
-      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "failure"}).at_least(:once)
-      vm_host = instance_double(VmHost, sshable: sshable)
-      fws = [instance_double(Firewall)]
-      ps = instance_double(PrivateSubnet, firewalls: fws)
-      expect(fws.first).to receive(:destroy)
+      expect(nx).to receive(:collect_final_telemetry)
+      fw = instance_double(Firewall)
+      ps = instance_double(PrivateSubnet, firewalls: [fw])
+      expect(fw).to receive(:destroy)
       expect(ps).to receive(:incr_destroy)
       expect(vm).to receive(:private_subnets).and_return([ps])
-      expect(vm).to receive(:vm_host).and_return(vm_host).at_least(:once)
-      expect(sshable).to receive(:cmd).with("sudo ln /vm/9qf22jbv/serial.log /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
-      expect(sshable).to receive(:cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
       expect(vm).to receive(:incr_destroy)
 
       expect { nx.destroy }.to hop("wait_vm_destroy")
@@ -590,50 +640,17 @@ RSpec.describe Prog::Vm::GithubRunner do
     it "skip deregistration and destroy vm immediately" do
       expect(nx).to receive(:decr_destroy)
       expect(github_runner).to receive(:skip_deregistration_set?).and_return(true)
-      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "success"}).at_least(:once)
+      expect(nx).to receive(:collect_final_telemetry)
       expect(vm).to receive(:incr_destroy)
 
       expect { nx.destroy }.to hop("wait_vm_destroy")
     end
 
-    it "destroys resources and hops if runner deregistered, also, copies serial log if workflow_job is nil" do
+    it "does not collect telemetry if the vm not allocated" do
       expect(nx).to receive(:decr_destroy)
       expect(client).to receive(:get).and_raise(Octokit::NotFound)
-      expect(client).not_to receive(:delete)
-
-      expect(github_runner).to receive(:workflow_job).and_return(nil)
-      vm_host = instance_double(VmHost, sshable: sshable)
-      expect(vm).to receive(:vm_host).and_return(vm_host).at_least(:once)
-      expect(sshable).to receive(:cmd).with("sudo ln /vm/9qf22jbv/serial.log /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
-      expect(sshable).to receive(:cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
-      expect(vm).to receive(:incr_destroy)
-
-      expect { nx.destroy }.to hop("wait_vm_destroy")
-    end
-
-    it "destroys resources and hops if runner deregistered, also, emits log if it couldn't move the serial.log" do
-      expect(nx).to receive(:decr_destroy)
-      expect(client).to receive(:get).and_raise(Octokit::NotFound)
-      expect(client).not_to receive(:delete)
-
-      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "failure"}).at_least(:once)
-      vm_host = instance_double(VmHost, sshable: sshable)
-      expect(vm).to receive(:vm_host).and_return(vm_host).at_least(:once)
-      expect(sshable).to receive(:cmd).and_raise Sshable::SshError.new("bogus", "", "", nil, nil)
-      expect(Clog).to receive(:emit).with("Failed to move serial.log or running journalctl").and_call_original
-      expect(vm).to receive(:incr_destroy)
-
-      expect { nx.destroy }.to hop("wait_vm_destroy")
-    end
-
-    it "simply destroys the VM if the workflow_job is there and the conclusion is success" do
-      expect(nx).to receive(:decr_destroy)
-      expect(client).to receive(:get).and_raise(Octokit::NotFound)
-      expect(client).not_to receive(:delete)
-
-      expect(github_runner).to receive(:workflow_job).and_return({"conclusion" => "success"}).at_least(:once)
-      expect(sshable).not_to receive(:cmd).with("sudo ln /vm/9qf22jbv/serial.log /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
-      expect(sshable).not_to receive(:cmd).with("journalctl -u runner-script --no-pager | grep -e run-withenv -e systemd | grep -v -e Started")
+      expect(vm).to receive(:vm_host).and_return(nil)
+      expect(nx).not_to receive(:collect_final_telemetry)
       expect(vm).to receive(:incr_destroy)
 
       expect { nx.destroy }.to hop("wait_vm_destroy")

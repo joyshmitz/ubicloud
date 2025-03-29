@@ -224,8 +224,8 @@ class Prog::Vm::GithubRunner < Prog::Base
       UBICLOUD_CACHE_URL=#{Config.base_url}/runtime/github/" | sudo tee -a /etc/environment
     COMMAND
 
-    if (mirror_vm = Vm[Config.docker_mirror_server_vm_id]) && vm.vm_host_id == mirror_vm.vm_host_id
-      mirror_address = "#{mirror_vm.load_balancer.hostname}:5000"
+    if github_runner.installation.use_docker_mirror
+      mirror_address = "mirror.gcr.io"
       command += <<~COMMAND
         # Configure Docker daemon with registry mirror
         if [ -f /etc/docker/daemon.json ] && [ -s /etc/docker/daemon.json ]; then
@@ -338,6 +338,32 @@ class Prog::Vm::GithubRunner < Prog::Base
     nap 60
   end
 
+  def collect_final_telemetry
+    # If the runner is not assigned any job or job is not successful, we log
+    # journalctl output to debug if there was any problem with the runner script.
+    if (job = github_runner.workflow_job).nil? || job.fetch("conclusion") != "success"
+      serial_log_path = "/vm/#{vm.inhost_name}/serial.log"
+      vm.vm_host.sshable.cmd("sudo ln #{serial_log_path} /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
+
+      # We grep only the lines related to 'run-withenv' and 'systemd'. Other
+      # logs include outputs from subprocesses like php, sudo, etc., which
+      # could contain sensitive data. 'run-withenv' is the main process,
+      # while systemd lines provide valuable insights into the lifecycle of
+      # the runner script, including OOM issues.
+      # We exclude the 'Started' line to avoid exposing the JIT token.
+      vm.sshable.cmd("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
+    end
+
+    # We log the remaining limit DockerHub rate limit to analyze it
+    docker_quota_limit_command = <<~COMMAND
+      TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+      curl -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
+    COMMAND
+    vm.sshable.cmd(docker_quota_limit_command)
+  rescue *Sshable::SSH_CONNECTION_ERRORS, Sshable::SshError
+    Clog.emit("Failed to collect final telemetry") { github_runner }
+  end
+
   label def destroy
     decr_destroy
 
@@ -368,31 +394,8 @@ class Prog::Vm::GithubRunner < Prog::Base
         subnet.incr_destroy
       end
 
-      # If the runner is not assigned any job and we destroy it after a
-      # timeline, the workflow_job is nil, in that case, we want to be able to
-      # see journalctl output to debug if there was any problem with the runner
-      # script.
-      #
-      # We also want to see the journalctl output if the runner script failed.
-      #
-      # Hence, the condition is added to check if the workflow_job is nil or
-      # the conclusion is failure.
-      if vm.vm_host && ((job = github_runner.workflow_job).nil? || job.fetch("conclusion") != "success")
-        begin
-          serial_log_path = "/vm/#{vm.inhost_name}/serial.log"
-          vm.vm_host.sshable.cmd("sudo ln #{serial_log_path} /var/log/ubicloud/serials/#{github_runner.ubid}_serial.log")
+      collect_final_telemetry if vm.vm_host
 
-          # We grep only the lines related to 'run-withenv' and 'systemd'. Other
-          # logs include outputs from subprocesses like php, sudo, etc., which
-          # could contain sensitive data. 'run-withenv' is the main process,
-          # while systemd lines provide valuable insights into the lifecycle of
-          # the runner script, including OOM issues.
-          # We exclude the 'Started' line to avoid exposing the JIT token.
-          vm.sshable.cmd("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
-        rescue Sshable::SshError
-          Clog.emit("Failed to move serial.log or running journalctl") { github_runner }
-        end
-      end
       vm.incr_destroy
     end
 
