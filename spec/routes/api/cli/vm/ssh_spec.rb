@@ -19,6 +19,10 @@ RSpec.describe Clover, "cli vm ssh" do
     expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128:1234::2]
   end
 
+  it "supports swapped arguments" do
+    expect(cli_exec(["vm", "ssh", @ref])).to eq %w[ssh -- ubi@128:1234::2]
+  end
+
   it "IPv4 address is used by default if available" do
     add_ipv4_to_vm(@vm, "128.0.0.1")
     expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128.0.0.1]
@@ -80,6 +84,6 @@ RSpec.describe Clover, "cli vm ssh" do
   it "handles invalid vm reference" do
     expect(cli(["vm", "#{@vm.display_location}/foo", "ssh"], status: 404)).to eq "! Unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for.\n"
     expect(cli(["vm", "foo/#{@vm.name}", "ssh"], status: 404)).to eq "! Unexpected response status: 404\nDetails: Validation failed for following path components: location\n  location: Given location is not a valid location. Available locations: eu-central-h1, eu-north-h1, us-east-a2\n"
-    expect(cli(["vm", "#{@vm.display_location}/#{@vm.name}/bar", "ssh"], status: 400)).to start_with "! Invalid vm reference, should be in location/vm-name or vm-id format\n"
+    expect(cli(["vm", "#{@vm.display_location}/#{@vm.name}/bar", "ssh"], status: 400)).to start_with "! Invalid vm reference (\"eu-central-h1/test-vm/bar\"), should be in location/vm-name or vm-id format\n"
   end
 end
